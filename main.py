@@ -29,7 +29,7 @@ class ContextPrefixPlugin(star.Star):
         super().__init__(context, config)
         plugin_dir = Path(__file__).resolve().parent
         self.dump_enabled = True
-        self.dump_path = plugin_dir / "requests.jsonl"
+        self.dump_path = plugin_dir / "requests.json"
         self.dump_lock = asyncio.Lock()
         self.dump_hook_unavailable_warned = False
 
@@ -61,7 +61,7 @@ class ContextPrefixPlugin(star.Star):
                 "Ignoring non-boolean dump enabled value in %s.", dump_config_path
             )
 
-        configured_dump_path = dump_config.get("path", "requests.jsonl")
+        configured_dump_path = dump_config.get("path", "requests.json")
         if isinstance(configured_dump_path, str) and configured_dump_path.strip():
             configured_dump_path = Path(configured_dump_path).expanduser()
             self.dump_path = (
@@ -257,7 +257,7 @@ class ContextPrefixPlugin(star.Star):
         Args:
             http_client: HTTPX client used by the OpenAI SDK.
             header_overrides: Header values to set, or None to remove them.
-            dump_enabled: Whether matching requests should be written to JSONL.
+            dump_enabled: Whether matching requests should be written to JSON.
 
         Returns:
             Whether the client exposes a compatible HTTPX request-hook interface.
@@ -314,7 +314,7 @@ class ContextPrefixPlugin(star.Star):
         if dump_hook is None and dump_enabled:
 
             async def capture_request(request: Any) -> None:
-                """Append one serialized Chat Completions request to JSONL.
+                """Append one serialized Chat Completions request to JSON.
 
                 Args:
                     request: Outbound HTTP request to capture.
