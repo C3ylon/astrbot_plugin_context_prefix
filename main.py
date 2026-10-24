@@ -78,6 +78,3 @@ class ContextPrefixPlugin(star.Star):
         create_with_context_prefix._astrbot_context_prefix = True
         create_with_context_prefix._astrbot_context_prefix_config = config or {}
         AsyncCompletions.create = create_with_context_prefix  # type: ignore[method-assign]
-
-
-__all__: list[str] = []
