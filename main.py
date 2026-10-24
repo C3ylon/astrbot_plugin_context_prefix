@@ -27,9 +27,59 @@ class ContextPrefixPlugin(star.Star):
             config: Legacy plugin configuration, retained for loader compatibility.
         """
         super().__init__(context, config)
-        self.dump_path = Path(__file__).with_name("requests.jsonl")
+        plugin_dir = Path(__file__).resolve().parent
+        self.dump_enabled = True
+        self.dump_path = plugin_dir / "requests.jsonl"
         self.dump_lock = asyncio.Lock()
         self.dump_hook_unavailable_warned = False
+
+        dump_config_path = plugin_dir / "dump.json"
+        try:
+            dump_config = json.loads(
+                dump_config_path.read_text(encoding="utf-8-sig")
+            )
+        except (OSError, json.JSONDecodeError) as exc:
+            self.logger.error(
+                "Failed to load dump configuration from %s: %s",
+                dump_config_path,
+                exc,
+            )
+            dump_config = {}
+
+        if not isinstance(dump_config, dict):
+            self.logger.error(
+                "Invalid dump configuration in %s; expected a JSON object.",
+                dump_config_path,
+            )
+            dump_config = {}
+
+        dump_enabled = dump_config.get("enabled", True)
+        if isinstance(dump_enabled, bool):
+            self.dump_enabled = dump_enabled
+        else:
+            self.logger.warning(
+                "Ignoring non-boolean dump enabled value in %s.", dump_config_path
+            )
+
+        configured_dump_path = dump_config.get("path", "requests.jsonl")
+        if isinstance(configured_dump_path, str) and configured_dump_path.strip():
+            configured_dump_path = Path(configured_dump_path).expanduser()
+            self.dump_path = (
+                configured_dump_path
+                if configured_dump_path.is_absolute()
+                else plugin_dir / configured_dump_path
+            ).resolve()
+        else:
+            self.logger.warning(
+                "Ignoring invalid dump path in %s; using %s.",
+                dump_config_path,
+                self.dump_path,
+            )
+
+        if self.dump_enabled:
+            self.logger.info("Request dumping enabled: %s", self.dump_path)
+        else:
+            self.logger.info("Request dumping disabled by configuration.")
 
         messages_path = Path(__file__).with_name("messages.json")
         try:
@@ -111,8 +161,10 @@ class ContextPrefixPlugin(star.Star):
         ) -> Any:
             sdk_client = getattr(client, "_client", None)
             http_client = getattr(sdk_client, "_client", None)
-            if not self._attach_request_hooks(http_client, header_overrides):
-                if not self.dump_hook_unavailable_warned:
+            if not self._attach_request_hooks(
+                http_client, header_overrides, self.dump_enabled
+            ):
+                if self.dump_enabled and not self.dump_hook_unavailable_warned:
                     self.logger.warning(
                         "Could not attach request hooks to the OpenAI HTTP client; "
                         "request dumping is unavailable."
@@ -198,12 +250,14 @@ class ContextPrefixPlugin(star.Star):
         self,
         http_client: Any,
         header_overrides: dict[str, str | None],
+        dump_enabled: bool,
     ) -> bool:
         """Attach header and request-dump hooks to an HTTPX client.
 
         Args:
             http_client: HTTPX client used by the OpenAI SDK.
             header_overrides: Header values to set, or None to remove them.
+            dump_enabled: Whether matching requests should be written to JSONL.
 
         Returns:
             Whether the client exposes a compatible HTTPX request-hook interface.
@@ -257,7 +311,7 @@ class ContextPrefixPlugin(star.Star):
         dump_hook_attribute = "_astrbot_context_prefix_dump_hook"
         dump_state_attribute = "_astrbot_context_prefix_dump_state"
         dump_hook = getattr(http_client, dump_hook_attribute, None)
-        if dump_hook is None:
+        if dump_hook is None and dump_enabled:
 
             async def capture_request(request: Any) -> None:
                 """Append one serialized Chat Completions request to JSONL.
@@ -274,6 +328,8 @@ class ContextPrefixPlugin(star.Star):
                     return
 
                 state = getattr(http_client, dump_state_attribute, {})
+                if not state.get("enabled", True):
+                    return
                 try:
                     raw_body = await request.aread()
                     try:
@@ -303,6 +359,10 @@ class ContextPrefixPlugin(star.Star):
                         "body": body,
                     }
                     async with state["lock"]:
+                        state["path"].parent.mkdir(
+                            parents=True,
+                            exist_ok=True,
+                        )
                         with state["path"].open("a", encoding="utf-8") as dump_file:
                             dump_file.write(
                                 json.dumps(record, ensure_ascii=False) + "\n"
@@ -320,6 +380,7 @@ class ContextPrefixPlugin(star.Star):
             http_client,
             dump_state_attribute,
             {
+                "enabled": dump_enabled,
                 "path": self.dump_path,
                 "lock": self.dump_lock,
                 "logger": self.logger,
