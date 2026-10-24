@@ -1,4 +1,5 @@
-name: astrbot_plugin_context_prefix
-desc: Customize and dump outbound Chat Completions messages and HTTP headers
+name: openai_request_capture
+display_name: OpenAI Request Capture
+desc: Capture OpenAI-compatible chat requests and optionally override their messages. Configure in config.yaml.
+author: AstrBot Team
 version: 1.0.0
-author: AstrBot
