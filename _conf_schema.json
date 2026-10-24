@@ -1,0 +1,7 @@
+{
+  "messages": {
+    "description": "JSON array of message objects with role and content, inserted in order before the conversation. Replaces AstrBot's generated leading system message.",
+    "type": "text",
+    "default": "[]"
+  }
+}
