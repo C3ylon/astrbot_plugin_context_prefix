@@ -1,4 +1,6 @@
+import asyncio
 import json
+from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
 from typing import Any
@@ -11,20 +13,24 @@ from astrbot.api import star
 @star.register(
     "astrbot_plugin_context_prefix",
     "AstrBot",
-    "Customize outbound Chat Completions messages and headers",
+    "Customize and dump outbound Chat Completions requests",
     "1.0.0",
 )
 class ContextPrefixPlugin(star.Star):
-    """Customize outbound Chat Completions messages and request headers."""
+    """Customize messages and headers, and record outbound requests."""
 
     def __init__(self, context: star.Context, config: dict | None = None) -> None:
-        """Initialize the request wrapper and load the configured message prefix.
+        """Initialize request customization and load local configuration.
 
         Args:
             context: AstrBot plugin context.
             config: Legacy plugin configuration, retained for loader compatibility.
         """
         super().__init__(context, config)
+        self.dump_path = Path(__file__).with_name("requests.jsonl")
+        self.dump_lock = asyncio.Lock()
+        self.dump_hook_unavailable_warned = False
+
         messages_path = Path(__file__).with_name("messages.json")
         try:
             prefix_messages = json.loads(messages_path.read_text(encoding="utf-8-sig"))
@@ -105,60 +111,27 @@ class ContextPrefixPlugin(star.Star):
         ) -> Any:
             sdk_client = getattr(client, "_client", None)
             http_client = getattr(sdk_client, "_client", None)
-            event_hooks = getattr(http_client, "event_hooks", None)
-            if isinstance(event_hooks, dict):
-                hook_attribute = "_astrbot_context_prefix_header_hook"
-                overrides_attribute = "_astrbot_context_prefix_header_overrides"
-                header_hook = getattr(http_client, hook_attribute, None)
-                if header_hook is None and header_overrides:
-                    async def apply_header_overrides(request: Any) -> None:
-                        """Apply configured changes to the final HTTP headers.
-
-                        Args:
-                            request: Outbound HTTP request to modify.
-                        """
-                        if (
-                            request.method.upper() != "POST"
-                            or not request.url.path.rstrip("/").endswith(
-                                "/chat/completions"
-                            )
-                        ):
-                            return
-
-                        overrides = getattr(http_client, overrides_attribute, {})
-                        for name, value in overrides.items():
-                            if value is None:
-                                if name in request.headers:
-                                    del request.headers[name]
-                            else:
-                                request.headers[name] = value
-
-                    event_hooks.setdefault("request", []).insert(
-                        0, apply_header_overrides
+            if not self._attach_request_hooks(http_client, header_overrides):
+                if not self.dump_hook_unavailable_warned:
+                    self.logger.warning(
+                        "Could not attach request hooks to the OpenAI HTTP client; "
+                        "request dumping is unavailable."
                     )
-                    setattr(http_client, hook_attribute, apply_header_overrides)
-                    header_hook = apply_header_overrides
-
-                if header_hook is not None:
-                    setattr(
-                        http_client,
-                        overrides_attribute,
-                        dict(header_overrides),
-                    )
-            elif header_overrides:
-                updated_kwargs = dict(kwargs)
-                extra_headers = dict(updated_kwargs.get("extra_headers") or {})
-                for name, value in header_overrides.items():
-                    for existing_name in list(extra_headers):
-                        if (
-                            isinstance(existing_name, str)
-                            and existing_name.lower() == name.lower()
-                        ):
-                            del extra_headers[existing_name]
-                    if value is not None:
-                        extra_headers[name] = value
-                updated_kwargs["extra_headers"] = extra_headers
-                kwargs = updated_kwargs
+                    self.dump_hook_unavailable_warned = True
+                if header_overrides:
+                    updated_kwargs = dict(kwargs)
+                    extra_headers = dict(updated_kwargs.get("extra_headers") or {})
+                    for name, value in header_overrides.items():
+                        for existing_name in list(extra_headers):
+                            if (
+                                isinstance(existing_name, str)
+                                and existing_name.lower() == name.lower()
+                            ):
+                                del extra_headers[existing_name]
+                        if value is not None:
+                            extra_headers[name] = value
+                    updated_kwargs["extra_headers"] = extra_headers
+                    kwargs = updated_kwargs
 
             messages = kwargs.get("messages")
             if prefix_messages and isinstance(messages, list):
@@ -220,3 +193,136 @@ class ContextPrefixPlugin(star.Star):
         create_with_context_prefix._astrbot_context_prefix = True
         create_with_context_prefix._astrbot_context_prefix_original = original_create
         setattr(AsyncCompletions, "create", create_with_context_prefix)
+
+    def _attach_request_hooks(
+        self,
+        http_client: Any,
+        header_overrides: dict[str, str | None],
+    ) -> bool:
+        """Attach header and request-dump hooks to an HTTPX client.
+
+        Args:
+            http_client: HTTPX client used by the OpenAI SDK.
+            header_overrides: Header values to set, or None to remove them.
+
+        Returns:
+            Whether the client exposes a compatible HTTPX request-hook interface.
+        """
+        event_hooks = getattr(http_client, "event_hooks", None)
+        if not isinstance(event_hooks, dict):
+            return False
+
+        header_hook_attribute = "_astrbot_context_prefix_header_hook"
+        header_overrides_attribute = "_astrbot_context_prefix_header_overrides"
+        header_hook = getattr(http_client, header_hook_attribute, None)
+        if header_hook is None and header_overrides:
+
+            async def apply_header_overrides(request: Any) -> None:
+                """Apply configured changes to the final HTTP headers.
+
+                Args:
+                    request: Outbound HTTP request to modify.
+                """
+                if (
+                    request.method.upper() != "POST"
+                    or not request.url.path.rstrip("/").endswith(
+                        "/chat/completions"
+                    )
+                ):
+                    return
+
+                overrides = getattr(
+                    http_client,
+                    header_overrides_attribute,
+                    {},
+                )
+                for name, value in overrides.items():
+                    if value is None:
+                        if name in request.headers:
+                            del request.headers[name]
+                    else:
+                        request.headers[name] = value
+
+            event_hooks.setdefault("request", []).insert(0, apply_header_overrides)
+            setattr(http_client, header_hook_attribute, apply_header_overrides)
+            header_hook = apply_header_overrides
+
+        if header_hook is not None:
+            setattr(
+                http_client,
+                header_overrides_attribute,
+                dict(header_overrides),
+            )
+
+        dump_hook_attribute = "_astrbot_context_prefix_dump_hook"
+        dump_state_attribute = "_astrbot_context_prefix_dump_state"
+        dump_hook = getattr(http_client, dump_hook_attribute, None)
+        if dump_hook is None:
+
+            async def capture_request(request: Any) -> None:
+                """Append one serialized Chat Completions request to JSONL.
+
+                Args:
+                    request: Outbound HTTP request to capture.
+                """
+                if (
+                    request.method.upper() != "POST"
+                    or not request.url.path.rstrip("/").endswith(
+                        "/chat/completions"
+                    )
+                ):
+                    return
+
+                state = getattr(http_client, dump_state_attribute, {})
+                try:
+                    raw_body = await request.aread()
+                    try:
+                        body = json.loads(raw_body)
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        body = raw_body.decode("utf-8", errors="replace")
+
+                    headers = {
+                        name: (
+                            "<redacted>"
+                            if name.lower()
+                            in {
+                                "authorization",
+                                "api-key",
+                                "x-api-key",
+                                "cookie",
+                            }
+                            else value
+                        )
+                        for name, value in request.headers.items()
+                    }
+                    record = {
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "method": request.method,
+                        "url": str(request.url),
+                        "headers": headers,
+                        "body": body,
+                    }
+                    async with state["lock"]:
+                        with state["path"].open("a", encoding="utf-8") as dump_file:
+                            dump_file.write(
+                                json.dumps(record, ensure_ascii=False) + "\n"
+                            )
+                except Exception:
+                    logger = state.get("logger")
+                    if logger:
+                        logger.exception("Failed to dump an outbound API request.")
+
+            event_hooks.setdefault("request", []).append(capture_request)
+            setattr(http_client, dump_hook_attribute, capture_request)
+            self.logger.info("Attached outbound request dumper to HTTP client.")
+
+        setattr(
+            http_client,
+            dump_state_attribute,
+            {
+                "path": self.dump_path,
+                "lock": self.dump_lock,
+                "logger": self.logger,
+            },
+        )
+        return True

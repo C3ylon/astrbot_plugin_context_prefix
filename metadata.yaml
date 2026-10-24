@@ -1,4 +1,4 @@
 name: astrbot_plugin_context_prefix
-desc: Customize outbound Chat Completions messages and HTTP headers
+desc: Customize and dump outbound Chat Completions messages and HTTP headers
 version: 1.0.0
 author: AstrBot
