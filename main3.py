@@ -1,6 +1,7 @@
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 import httpx
 from openai import OpenAI
 
@@ -12,6 +13,8 @@ from openai import OpenAI
 BASE_URL = "https://api.deepseek.com"
 MODEL = "deepseek-flash"
 DEEPSEEK_API_KEY = "xxx"
+
+REASONING_EFFORT = "high"
 
 DUMP_DIR = Path("toyagent_log")
 DUMP_DIR.mkdir(parents=True, exist_ok=True)
@@ -28,6 +31,8 @@ MAX_CONTENT_CHARS = 2500
 USE_DEFAULT_INPUT = False
 
 DEFAULT_INPUT = ""
+
+USE_STREAM = True
 
 OVERLOAD_MSG = [
     {
@@ -101,6 +106,23 @@ client = OpenAI(
     api_key=DEEPSEEK_API_KEY,
     base_url=BASE_URL,
     http_client=http_client,
+    max_retries=2,
+)
+
+# 流式请求使用独立的客户端：请求仍照常写入 REQUEST_LOG，
+# 但不注册响应钩子——在钩子里读取响应会提前消费整个流，
+# 破坏逐字输出。完整响应改由 chat_turn_stream 汇总后写入 RESPONSE_LOG。
+stream_http_client = httpx.Client(
+    timeout=60.0,
+    event_hooks={
+        "request": [log_request],
+    },
+)
+
+stream_client = OpenAI(
+    api_key=DEEPSEEK_API_KEY,
+    base_url=BASE_URL,
+    http_client=stream_http_client,
     max_retries=2,
 )
 
@@ -258,7 +280,24 @@ def call_model(messages: list[dict]):
         tools=TOOLS,
         tool_choice="auto",
         stream=False,
-        reasoning_effort="high",
+        reasoning_effort=REASONING_EFFORT,
+        extra_body={
+            "thinking": {"type": "enabled"}
+        },
+    )
+
+
+def call_model_stream(messages: list[dict]):
+    """执行一次流式模型请求。"""
+
+    return stream_client.chat.completions.create(
+        model=MODEL,
+        messages=messages,
+        tools=TOOLS,
+        tool_choice="auto",
+        stream=True,
+        stream_options={"include_usage": True},
+        reasoning_effort=REASONING_EFFORT,
         extra_body={
             "thinking": {"type": "enabled"}
         },
@@ -311,8 +350,160 @@ def chat_turn(messages: list[dict]) -> str:
     )
 
 
+def _delta_attr(delta, name: str):
+    """读取流式 delta 字段。
+
+    兼容 SDK 未类型化的扩展字段（如思考模式的 reasoning_content），
+    这类字段可能只存在于 model_extra 中。
+    """
+
+    value = getattr(delta, name, None)
+    if value is None and hasattr(delta, "model_extra"):
+        value = (delta.model_extra or {}).get(name)
+    return value
+
+
+def chat_turn_stream(messages: list[dict]) -> str:
+    """完成一轮用户对话（流式），包括任意必要的工具调用。
+
+    流式过程中逐字打印思考内容与可见回复：
+      [Thinking]: 思考内容（reasoning_content）
+      [Assistant]: 最终回复内容
+    收集结束后把完整响应汇总写入 RESPONSE_LOG，使三种日志
+    （请求 / 响应 / 工具）在流式模式下依然完整记录。
+    """
+
+    # 跨工具调用轮次复用，避免重复打印前缀。
+    thinking_started = False
+    answer_started = False
+
+    for round_index in range(1, MAX_TOOL_ROUNDS + 1):
+        stream = call_model_stream(messages)
+
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        tool_calls_acc: dict[int, dict] = {}
+        finish_reason = None
+        usage = None
+
+        with stream:
+            for chunk in stream:
+                if chunk.usage:
+                    usage = chunk.usage.model_dump()
+
+                if not chunk.choices:
+                    continue
+
+                choice = chunk.choices[0]
+
+                if choice.finish_reason:
+                    finish_reason = choice.finish_reason
+
+                delta = choice.delta
+                if delta is None:
+                    continue
+
+                reasoning_part = _delta_attr(delta, "reasoning_content")
+                if reasoning_part:
+                    reasoning_parts.append(reasoning_part)
+                    if not thinking_started:
+                        print("\n[Thinking]: ", end="", flush=True)
+                        thinking_started = True
+                    print(reasoning_part, end="", flush=True)
+
+                content_part = _delta_attr(delta, "content")
+                if content_part:
+                    content_parts.append(content_part)
+                    if not answer_started:
+                        print("\n[Assistant]: ", end="", flush=True)
+                        answer_started = True
+                    print(content_part, end="", flush=True)
+
+                for tc_delta in delta.tool_calls or []:
+                    index = tc_delta.index
+                    acc = tool_calls_acc.setdefault(index, {
+                        "id": None,
+                        "type": "function",
+                        "function": {"name": "", "arguments": ""},
+                    })
+
+                    if tc_delta.id:
+                        acc["id"] = tc_delta.id
+
+                    if tc_delta.function:
+                        if tc_delta.function.name:
+                            acc["function"]["name"] += tc_delta.function.name
+                        if tc_delta.function.arguments:
+                            acc["function"]["arguments"] += tc_delta.function.arguments
+
+        content = "".join(content_parts) or None
+        reasoning = "".join(reasoning_parts) or None
+        tool_calls = [
+            tool_calls_acc[index] for index in sorted(tool_calls_acc)
+        ]
+
+        # 组装与流式模型一致的完整 assistant 消息。
+        assistant_message = {"role": "assistant"}
+        if content is not None:
+            assistant_message["content"] = content
+        if reasoning:
+            assistant_message["reasoning_content"] = reasoning
+        if tool_calls:
+            assistant_message["tool_calls"] = tool_calls
+        messages.append(assistant_message)
+
+        # 汇总完整响应写入 RESPONSE_LOG。
+        response = getattr(stream, "response", None)
+        append_json(RESPONSE_LOG, {
+            "timestamp": timestamp(),
+            "method": response.request.method if response else "POST",
+            "url": str(response.request.url) if response else "",
+            "status_code": response.status_code if response else None,
+            "streamed": True,
+            "finish_reason": finish_reason,
+            "content": content,
+            "reasoning_content": reasoning,
+            "tool_calls": tool_calls or None,
+            "usage": usage,
+        })
+
+        append_json(TOOL_LOG, {
+            "timestamp": timestamp(),
+            "event": "model_turn",
+            "round": round_index,
+            "finish_reason": finish_reason,
+            "tool_call_count": len(tool_calls),
+            "usage": usage,
+        })
+
+        if not tool_calls:
+            return content or ""
+
+        for tool_call_data in tool_calls:
+            # 复用 execute_tool，通过 SimpleNamespace 还原其期望的
+            # tool_call 对象形状（.id / .function.name / .function.arguments）。
+            tool_call_obj = SimpleNamespace(
+                id=tool_call_data["id"],
+                function=SimpleNamespace(
+                    name=tool_call_data["function"]["name"],
+                    arguments=tool_call_data["function"]["arguments"],
+                ),
+            )
+            result = execute_tool(tool_call_obj)
+
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call_data["id"],
+                "content": result,
+            })
+
+    raise RuntimeError(
+        f"工具调用超过上限：{MAX_TOOL_ROUNDS} 轮"
+    )
+
+
 # ============================================================
-# 主程序：非流式多轮对话
+# 主程序：多轮对话（流式 / 非流式）
 # ============================================================
 
 def main():
@@ -344,8 +535,12 @@ def main():
             })
 
             try:
-                answer = chat_turn(messages)
-                print(f"\n[Assistant]: {answer}")
+                if USE_STREAM:
+                    chat_turn_stream(messages)
+                    print()
+                else:
+                    answer = chat_turn(messages)
+                    print(f"\n[Assistant]: {answer}")
 
             except Exception as exc:
                 append_json(TOOL_LOG, {
@@ -376,6 +571,7 @@ def main():
                 break
     finally:
         http_client.close()
+        stream_http_client.close()
 
 
 if __name__ == "__main__":
